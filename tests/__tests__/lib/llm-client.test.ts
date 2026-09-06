@@ -5,18 +5,15 @@ import {
   generateWithBestProvider,
 } from '@/lib/llm-client';
 
-// Mock dependencies
 // The model ids are deliberately absent: they come from `ai-kit` now, not from
 // this repo. Asserting them literally here is what made these tests agree with
 // a production outage — they mocked `llama-3.1-8b-instant` and passed happily
 // for as long as Groq had been refusing that id in production.
-vi.mock('@/lib/constants', () => ({
-  API_CONFIG: {
-    GROQ_API_URL: 'https://api.groq.com/openai/v1/chat/completions',
-    OPENROUTER_API_URL: 'https://openrouter.ai/api/v1/chat/completions',
-  },
-}));
-
+//
+// The endpoint URLs are gone from here for the same reason. They used to be
+// mocked out of `@/lib/constants`; the client now takes them from the same
+// `ai-kit` provider record that supplies the model list, so a mock of them
+// would assert a copy nothing reads.
 import { freeChain, providerModels } from '@bitbaum/ai-kit';
 
 const GROQ_MODELS = providerModels(freeChain('BOTSMANN')[0]);
@@ -51,6 +48,40 @@ if (!AbortSignal.timeout) {
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
+/**
+ * Real `Response` objects, not `{ ok, json }` literals.
+ *
+ * These tests used to hand back hand-built objects with only `json()`. That
+ * quietly encoded an assumption about HOW the client reads a body, and it broke
+ * the moment the client started reading the text first (to keep the vendor's
+ * body in the error, which is the difference between "429" and "your daily
+ * budget is gone, it resets in 4h"). A fake that diverges from the contract it
+ * imitates is how a suite stays green over a client that cannot work.
+ */
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function completion(content: string) {
+  return jsonResponse({ choices: [{ message: { content } }] });
+}
+
+/**
+ * A fetch mock that returns a FRESH `Response` per call.
+ *
+ * `mockResolvedValue(new Response(...))` hands every link the same object, and
+ * a `Response` body can only be read once — so link two always failed with
+ * "Body has already been read", a fake failure standing in front of whatever
+ * the real behaviour was. Anything that walks a chain needs a factory, not a
+ * value.
+ */
+function alwaysRespond(make: () => Response) {
+  mockFetch.mockImplementation(async () => make());
+}
+
 import { getServerEnv } from '@/lib/config/env';
 import type { Mock } from 'vitest';
 
@@ -75,12 +106,11 @@ const testMessages = [
 describe('generateLLMResponse', () => {
   describe('groq provider', () => {
     it('sends correct request to Groq API', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           choices: [{ message: { content: 'Hello back!' } }],
         }),
-      });
+      );
 
       const result = await generateLLMResponse(testMessages, { provider: 'groq' });
 
@@ -89,7 +119,9 @@ describe('generateLLMResponse', () => {
         expect.objectContaining({
           method: 'POST',
           headers: expect.objectContaining({
-            Authorization: 'Bearer test-groq-key',
+            // lowercase: ai-kit's casing. HTTP header names are
+            // case-insensitive, so this is a spelling change, not a contract one.
+            authorization: 'Bearer test-groq-key',
           }),
           body: expect.stringContaining(`"model":"${GROQ_MODELS[0]}"`),
         }),
@@ -109,15 +141,12 @@ describe('generateLLMResponse', () => {
       // Before this, `generateWithBestProvider` picked one provider and called
       // it once, so a retired id was simply a dead chatbot.
       mockFetch
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 404,
-          text: async () => '{"error":{"code":"model_not_found"}}',
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ choices: [{ message: { content: 'second model' } }] }),
-        });
+        .mockResolvedValueOnce(
+          new Response('{"error":{"code":"model_not_found"}}', { status: 404 }),
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({ choices: [{ message: { content: 'second model' } }] }),
+        );
 
       const result = await generateLLMResponse(testMessages, { provider: 'groq' });
 
@@ -128,25 +157,23 @@ describe('generateLLMResponse', () => {
     });
 
     it('reports the whole list when every model fails', async () => {
-      mockFetch.mockResolvedValue({
-        ok: false,
-        status: 429,
-        text: async () => 'rate limit exceeded',
-      });
+      alwaysRespond(() => new Response('rate limit exceeded', { status: 429 }));
 
+      // Every link named, not just the last — a chain that reports only its
+      // final failure makes "the key is dead" and "one model rotted" read the
+      // same in a log.
       await expect(generateLLMResponse(testMessages, { provider: 'groq' })).rejects.toThrow(
-        /all \d+ model\(s\) failed/,
+        /All \d+ link\(s\) failed/,
       );
       expect(mockFetch).toHaveBeenCalledTimes(GROQ_MODELS.length);
     });
 
     it('uses provided API key over server key', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           choices: [{ message: { content: 'ok' } }],
         }),
-      });
+      );
 
       await generateLLMResponse(testMessages, { provider: 'groq', apiKey: 'user-key' });
 
@@ -154,7 +181,7 @@ describe('generateLLMResponse', () => {
         expect.any(String),
         expect.objectContaining({
           headers: expect.objectContaining({
-            Authorization: 'Bearer user-key',
+            authorization: 'Bearer user-key',
           }),
         }),
       );
@@ -168,26 +195,39 @@ describe('generateLLMResponse', () => {
       );
     });
 
-    it('throws on non-ok response', async () => {
-      mockFetch.mockResolvedValue({
-        ok: false,
-        status: 429,
-        text: async () => 'rate limited',
-      });
+    it('a 429 says WHICH kind of limit, not just the status code', async () => {
+      alwaysRespond(() => new Response('rate limited', { status: 429 }));
 
+      // The old message was 'Groq API error: 429'. Capacity, request-too-large
+      // and daily-quota share that status code and want opposite responses:
+      // retry shortly, send less, or come back tomorrow. Only the body tells
+      // them apart, and it used to be read, logged and discarded.
       await expect(generateLLMResponse(testMessages, { provider: 'groq' })).rejects.toThrow(
-        'Groq API error: 429',
+        /429 capacity/,
       );
     });
 
-    it('returns empty string when no content in response', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({ choices: [{ message: {} }] }),
-      });
+    it("an empty 200 is a FAILURE that demotes — it used to be the bot's reply", async () => {
+      // This test previously asserted `result.content === ''`: a 200 carrying
+      // no content was handed straight to the user as the assistant's answer,
+      // and the chain stopped, satisfied. A reasoning model that spends its
+      // whole budget thinking returns exactly this shape.
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ choices: [{ message: {} }] }))
+        .mockResolvedValueOnce(completion('the next link had something to say'));
 
       const result = await generateLLMResponse(testMessages, { provider: 'groq' });
-      expect(result.content).toBe('');
+
+      expect(result.content).toBe('the next link had something to say');
+      expect(result.model).toBe(GROQ_MODELS[1]);
+    });
+
+    it('an empty 200 at EVERY link throws rather than answering with nothing', async () => {
+      alwaysRespond(() => jsonResponse({ choices: [{ message: { content: '' } }] }));
+
+      await expect(generateLLMResponse(testMessages, { provider: 'groq' })).rejects.toThrow(
+        /empty content/,
+      );
     });
   });
 
@@ -198,13 +238,28 @@ describe('generateLLMResponse', () => {
       );
     });
 
+    it('sends the attribution headers OpenRouter ranks apps by', async () => {
+      alwaysRespond(() => completion('response'));
+
+      await generateLLMResponse(testMessages, { provider: 'openrouter', apiKey: 'or-key' });
+
+      // OpenRouter reads these for app attribution in its public rankings.
+      // Dropping them breaks nothing, errors nowhere and logs nothing —
+      // Botsmann simply disappears from that list. Exactly the kind of loss
+      // that survives a refactor unnoticed unless a test names it, which is
+      // why ai-kit grew `extraHeaders` rather than this call losing them.
+      const [, init] = mockFetch.mock.calls[0];
+      expect(init.headers['HTTP-Referer']).toBe('http://localhost:3000');
+      expect(init.headers['X-Title']).toBe('Botsmann');
+      expect(init.headers.authorization).toBe('Bearer or-key');
+    });
+
     it('uses default model when none specified', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           choices: [{ message: { content: 'response' } }],
         }),
-      });
+      );
 
       const result = await generateLLMResponse(testMessages, {
         provider: 'openrouter',
@@ -226,12 +281,11 @@ describe('generateLLMResponse', () => {
     });
 
     it('uses custom model when specified', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           choices: [{ message: { content: 'response' } }],
         }),
-      });
+      );
 
       const result = await generateLLMResponse(testMessages, {
         provider: 'openrouter',
@@ -245,12 +299,11 @@ describe('generateLLMResponse', () => {
 
   describe('ollama provider', () => {
     it('uses default URL when none provided', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           message: { content: 'local response' },
         }),
-      });
+      );
 
       const result = await generateLLMResponse(testMessages, { provider: 'ollama' });
 
@@ -265,12 +318,11 @@ describe('generateLLMResponse', () => {
     });
 
     it('uses custom ollama URL', async () => {
-      mockFetch.mockResolvedValue({
-        ok: true,
-        json: async () => ({
+      mockFetch.mockResolvedValue(
+        jsonResponse({
           message: { content: 'ok' },
         }),
-      });
+      );
 
       await generateLLMResponse(testMessages, {
         provider: 'ollama',
@@ -297,12 +349,11 @@ describe('generateLLMResponse', () => {
   });
 
   it('passes temperature and maxTokens', async () => {
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
+    mockFetch.mockResolvedValue(
+      jsonResponse({
         choices: [{ message: { content: 'ok' } }],
       }),
-    });
+    );
 
     await generateLLMResponse(testMessages, {
       provider: 'groq',
@@ -318,7 +369,7 @@ describe('generateLLMResponse', () => {
 
 describe('isOllamaAvailable', () => {
   it('returns true when Ollama responds ok', async () => {
-    mockFetch.mockResolvedValue({ ok: true });
+    mockFetch.mockResolvedValue(new Response('{}', { status: 200 }));
 
     const result = await isOllamaAvailable('http://localhost:11434');
     expect(result).toBe(true);
@@ -336,7 +387,7 @@ describe('isOllamaAvailable', () => {
   });
 
   it('returns false when Ollama returns non-ok', async () => {
-    mockFetch.mockResolvedValue({ ok: false });
+    mockFetch.mockResolvedValue(new Response('nope', { status: 500 }));
 
     const result = await isOllamaAvailable();
     expect(result).toBe(false);
@@ -345,7 +396,7 @@ describe('isOllamaAvailable', () => {
 
 describe('getBestProvider', () => {
   it('prefers Ollama when available', async () => {
-    mockFetch.mockResolvedValue({ ok: true });
+    mockFetch.mockResolvedValue(new Response('{}', { status: 200 }));
 
     const result = await getBestProvider();
     expect(result.provider).toBe('ollama');
@@ -412,12 +463,9 @@ describe('generateWithBestProvider — provider-level failover', () => {
       const target = String(url);
       if (target.includes('11434')) throw new Error('connection refused'); // no Ollama
       if (target.includes('groq.com')) {
-        return { ok: false, status: 401, text: async () => '{"error":{"code":"invalid_api_key"}}' };
+        return new Response('{"error":{"code":"invalid_api_key"}}', { status: 401 });
       }
-      return {
-        ok: true,
-        json: async () => ({ choices: [{ message: { content: 'from openrouter' } }] }),
-      };
+      return jsonResponse({ choices: [{ message: { content: 'from openrouter' } }] });
     });
 
     const result = await generateWithBestProvider(messages);
@@ -436,7 +484,7 @@ describe('generateWithBestProvider — provider-level failover', () => {
 
     mockFetch.mockImplementation(async (url: string) => {
       if (String(url).includes('11434')) throw new Error('connection refused');
-      return { ok: false, status: 401, text: async () => 'invalid_api_key' };
+      return new Response('invalid_api_key', { status: 401 });
     });
 
     // Wording moved from "provider(s)" to "link(s)" when the walk moved into

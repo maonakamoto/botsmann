@@ -7,26 +7,17 @@
  * - Ollama (local)
  */
 
-import { freeChain, providerModels, usableChain, tryChain } from '@bitbaum/ai-kit';
-import { API_CONFIG } from '@/lib/constants';
+import {
+  complete,
+  freeChain,
+  providerModels,
+  usableChain,
+  linkId,
+  type Link,
+  type Provider,
+} from '@bitbaum/ai-kit';
 import { getServerEnv, getClientEnv } from '@/lib/config/env';
 import { logger } from './logger';
-
-/**
- * The models to try at each vendor, in order, from `ai-kit`.
- *
- * A list rather than a name, because the previous single ids were retired out
- * from under this app and there was nothing between that and total failure:
- * `generateWithBestProvider` picks ONE provider and calls it once. A retired id
- * was a dead chatbot with a valid key.
- *
- * The lists cross models, not vendors — vendor selection above stays exactly as
- * it was. That is the smaller half of the protection (a spent daily budget is
- * org-wide, so every model at the same vendor dies together), but it is the
- * half that covers rot, which is what actually happened here twice.
- */
-const groqModels = () => providerModels(freeChain('BOTSMANN')[0]);
-const openRouterModels = () => providerModels(freeChain('BOTSMANN')[1]);
 
 export type ModelProvider = 'groq' | 'openrouter' | 'ollama';
 
@@ -80,44 +71,71 @@ export async function generateLLMResponse(
 }
 
 /**
- * One call, one model, at Groq. The single-shot primitive both
- * `generateWithGroq`'s model loop and the ai-kit chain in
- * `generateWithBestProvider` walk over — a 404 here means the id was
- * retired, a 429 means this model is busy or spent, and either way the
- * caller's job is to try the next link, not this function's.
+ * One vendor's chain, in `ai-kit`'s shape.
+ *
+ * The key travels through a synthetic env rather than being baked into a
+ * closure, because that is the seam `complete()` reads — so a BYOK caller's
+ * key and this server's own key take the same path instead of two.
  */
-async function callGroqModel(
-  model: string,
+function vendorChain(
+  which: 0 | 1,
   key: string,
+  models?: string[],
+): { chain: Link[]; env: Record<string, string> } {
+  const provider = freeChain('BOTSMANN')[which] as Provider;
+  const ids = models?.length ? models : providerModels(provider);
+  return {
+    chain: ids.map((model) => ({ provider, model })),
+    env: { [provider.keyEnv]: key },
+  };
+}
+
+/**
+ * Walk a chain and answer, or throw naming every link that failed.
+ *
+ * WHY THIS REPLACED TWO HAND-ROLLED LOOPS AND TWO `fetch` CALLS.
+ *
+ * The loops had the right shape and the wrong judgements — the fleet's most
+ * common AI defect (census 2026-09-06: 9 of 12 hand-rolled clients share it):
+ *
+ *   - `data.choices[0]?.message?.content || ''` handed an EMPTY 200 to the
+ *     user as the bot's reply. A reasoning model that spends its budget
+ *     thinking returns exactly that, and so does a vendor having a moment.
+ *     `complete()` calls it a failure and demotes to the next link.
+ *   - a 429 became `throw new Error('Groq API error: ' + status)`: the body
+ *     was read, logged, and discarded. The three kinds of 429 share that
+ *     status code and want opposite responses. A DAILY cap condemns the whole
+ *     vendor, because its other models draw on the same exhausted org-wide
+ *     budget; a SIZE cap means demoting is strictly WORSE, since the next
+ *     model's ceiling is smaller.
+ *   - neither call had a DEADLINE. A vendor that accepted the connection and
+ *     never answered held the chat open indefinitely, and the fallback beneath
+ *     it was never reached — a chain that cannot time out is not a fallback
+ *     for the outage it most needs to survive.
+ */
+async function completeOn(
+  { chain, env }: { chain: Link[]; env: Record<string, string> },
   messages: LLMMessage[],
   temperature: number,
   maxTokens: number,
+  extraHeaders?: Record<string, string>,
 ): Promise<LLMResponse> {
-  const response = await fetch(API_CONFIG.GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
+  const result = await complete({
+    chain,
+    env,
+    messages,
+    temperature,
+    maxTokens,
+    extraHeaders,
+    onLinkFailure: (link: Link, error: Error) => {
+      logger.warn(`[LLM] ${linkId(link)} failed, trying next`, { error: error.message });
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature,
-      max_tokens: maxTokens,
-    }),
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    logger.error(`Groq API error: ${response.status} (model ${model})`, text);
-    throw new Error(`Groq API error: ${response.status}`);
-  }
-
-  const data = await response.json();
   return {
-    content: data.choices[0]?.message?.content || '',
-    provider: 'groq',
-    model,
+    content: result.text,
+    provider: result.link.provider.id as ModelProvider,
+    model: result.link.model,
   };
 }
 
@@ -138,59 +156,21 @@ async function generateWithGroq(
     throw new Error('Groq API key not configured');
   }
 
-  const models = groqModels();
-  let lastError: Error = new Error('Groq API error: no model attempted');
-
-  for (const model of models) {
-    try {
-      return await callGroqModel(model, key, messages, temperature, maxTokens);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-    }
-  }
-
-  throw new Error(`${lastError.message} — all ${models.length} model(s) failed`);
+  return completeOn(vendorChain(0, key), messages, temperature, maxTokens);
 }
 
 /**
- * One call, one model, at OpenRouter — the single-shot primitive both
- * `generateWithOpenRouter`'s model loop and the ai-kit chain walk over.
- * Supports Claude, GPT-4, Gemini, Grok, Llama, Mistral, and more.
+ * OpenRouter reads these for app attribution in its public rankings.
+ *
+ * Carried through `complete`'s `extraHeaders` (ai-kit >= 0.10.0), which exists
+ * because of this call site: without it, adopting the shared engine would have
+ * dropped Botsmann off that list with no error, no log line, and nothing to
+ * notice — a silent downgrade disguised as a refactor.
  */
-async function callOpenRouterModel(
-  model: string,
-  apiKey: string,
-  messages: LLMMessage[],
-  temperature: number,
-  maxTokens: number,
-): Promise<LLMResponse> {
-  const response = await fetch(API_CONFIG.OPENROUTER_API_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': getClientEnv().NEXT_PUBLIC_APP_URL,
-      'X-Title': 'Botsmann',
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature,
-      max_tokens: maxTokens,
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    logger.error(`OpenRouter API error: ${response.status} (model ${model})`, text);
-    throw new Error(`OpenRouter API error: ${response.status}`);
-  }
-
-  const data = await response.json();
+function openRouterAttribution(): Record<string, string> {
   return {
-    content: data.choices[0]?.message?.content || '',
-    provider: 'openrouter',
-    model,
+    'HTTP-Referer': getClientEnv().NEXT_PUBLIC_APP_URL,
+    'X-Title': 'Botsmann',
   };
 }
 
@@ -211,18 +191,13 @@ async function generateWithOpenRouter(
 
   // An explicit caller override is honoured as-is and alone: if someone names a
   // model, silently answering from a different one is worse than failing.
-  const models = model ? [model] : openRouterModels();
-  let lastError: Error = new Error('OpenRouter API error: no model attempted');
-
-  for (const selectedModel of models) {
-    try {
-      return await callOpenRouterModel(selectedModel, apiKey, messages, temperature, maxTokens);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-    }
-  }
-
-  throw new Error(`${lastError.message} — all ${models.length} model(s) failed`);
+  return completeOn(
+    vendorChain(1, apiKey, model ? [model] : undefined),
+    messages,
+    temperature,
+    maxTokens,
+    openRouterAttribution(),
+  );
 }
 
 /**
@@ -364,9 +339,12 @@ export async function getBestProvider(): Promise<{
  * key look identical to having no provider at all \u2014 botsmann's Groq key
  * started returning 401 and the whole AI layer went down while an
  * OpenRouter key sat unused. Now it is ONE chain, built and walked by
- * `ai-kit` (`usableChain`/`tryChain`): provider and model demote together,
+ * `ai-kit` (`usableChain` + `complete`): provider and model demote together,
  * in a single pass, and `ai-kit` owns the ordering so a fix to the chain
  * lands here without a matching edit in this file.
+ *
+ * `complete` also owns the REQUEST now, which is where this file's remaining
+ * defects lived — see `completeOn` for what the hand-rolled version got wrong.
  *
  * Ollama stays outside that chain and is tried first: its availability is a
  * live ping, not an API key, which does not fit `ai-kit`'s `Provider` shape.
@@ -389,31 +367,31 @@ export async function generateWithBestProvider(
     }
   }
 
-  const chain = usableChain(freeChain('BOTSMANN'), {
-    GROQ_API_KEY: env.GROQ_API_KEY,
-    OPENROUTER_API_KEY: env.OPENROUTER_API_KEY,
-  });
+  // One chain across BOTH vendors, so provider and model demote together in a
+  // single pass. The key for each link is resolved into a synthetic env, which
+  // is the seam `complete()` reads — the previous `attempt` callback had to
+  // branch on `provider.id` to pick a key, and that branch was the last place
+  // this file still made a decision the engine already owns.
+  const keys = {
+    GROQ_API_KEY: cleanApiKey(env.GROQ_API_KEY) ?? '',
+    OPENROUTER_API_KEY: env.OPENROUTER_API_KEY ?? '',
+  };
+  const chain = usableChain(freeChain('BOTSMANN'), keys);
 
   if (chain.length === 0) {
     throw new Error('No LLM provider available. Start Ollama or configure API keys.');
   }
 
-  const response = await tryChain(chain, {
-    attempt: ({ provider, model }) => {
-      if (provider.id === 'groq') {
-        const key = cleanApiKey(env.GROQ_API_KEY);
-        if (!key) throw new Error('Groq API key not configured');
-        return callGroqModel(model, key, messages, temperature, maxTokens);
-      }
-      if (!env.OPENROUTER_API_KEY) throw new Error('OpenRouter API key required');
-      return callOpenRouterModel(model, env.OPENROUTER_API_KEY, messages, temperature, maxTokens);
-    },
-    onLinkFailure: (link, error) => {
-      logger.warn(`[LLM] ${link.provider.id}/${link.model} failed, trying next`, {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    },
-  });
+  const response = await completeOn(
+    { chain, env: keys },
+    messages,
+    temperature,
+    maxTokens,
+    // Harmless at Groq, which ignores unknown headers, and required at
+    // OpenRouter — one chain means one header set, and losing attribution to
+    // avoid sending two extra headers to Groq would be the wrong trade.
+    openRouterAttribution(),
+  );
 
   return { ...response, providerInfo: `${response.provider} (${response.model})` };
 }
